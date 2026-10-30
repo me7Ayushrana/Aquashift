@@ -19,11 +19,12 @@ async def simulate_water_sweep(
     request: Optional[SweepRequest] = None,
 ) -> SweepResponse:
     """Run parametric water availability sweep from 100% down to 20% of baseline water availability."""
-    cache_key = scenario_cache.make_key("sweep", request or {})
+    req = request or SweepRequest()
+    cache_key = scenario_cache.make_key("sweep", req)
     cached = scenario_cache.get(cache_key)
     if cached is not None:
         return cached
 
-    response = _sweep.run_sweep(request=request)
+    response = _sweep.run_sweep(request=req)
     scenario_cache.set(cache_key, response)
     return response

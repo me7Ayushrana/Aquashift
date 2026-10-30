@@ -9,10 +9,12 @@ from backend.app.models.schemas import (
     InputRangeConfig,
     WeatherScenarioConfig,
 )
+from backend.app.optimizer.model import AquaShiftOptimizer
 
 router = APIRouter(tags=["Configuration"])
 
 DATA_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data"
+_optimizer = AquaShiftOptimizer()
 
 
 @router.get("/config", response_model=ConfigResponse)
@@ -110,14 +112,20 @@ async def get_config() -> ConfigResponse:
         "caloric_density": "kcal per kilogram (kcal/kg)",
     }
 
-    # 5. Baseline assumptions
+    # 5. Baseline assumptions (dynamically derived from canonical optimizer baseline)
+    _, ref_baseline = _optimizer.calculate_baseline(
+        total_land_ha=10.0,
+        rainfall_scenario="normal",
+        water_availability_ratio=1.0,
+        selected_crops=_optimizer.all_crops,
+    )
     baseline_assumptions = {
         "reference_land_ha": 10.0,
         "paddy_share": 0.70,
         "maize_share": 0.30,
-        "baseline_water_m3": 104127.3,
-        "baseline_food_kcal": 162750000.0,
-        "baseline_net_income_inr": 960136.0,
+        "baseline_water_m3": ref_baseline["total_water_use_m3"],
+        "baseline_food_kcal": ref_baseline["total_food_kcal"],
+        "baseline_net_income_inr": ref_baseline["total_net_income_inr"],
     }
 
     return ConfigResponse(

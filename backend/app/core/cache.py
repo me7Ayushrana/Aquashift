@@ -4,6 +4,7 @@ Ensures repeated requests with identical input parameters return instantaneously
 without re-running solver or model inference, while avoiding stale results.
 """
 from collections import OrderedDict
+import copy
 import hashlib
 import json
 import threading
@@ -11,7 +12,7 @@ from typing import Any, Optional
 
 
 class ScenarioCache:
-    """Thread-safe in-memory LRU cache."""
+    """Thread-safe in-memory LRU cache with caller immutability."""
 
     def __init__(self, maxsize: int = 256):
         self.maxsize = maxsize
@@ -28,24 +29,32 @@ class ScenarioCache:
         else:
             raw = str(payload)
 
+        # Normalize selected_crops or crops list order if present in dict
+        if isinstance(raw, dict):
+            raw = dict(raw)
+            if "selected_crops" in raw and isinstance(raw["selected_crops"], list):
+                raw["selected_crops"] = sorted(raw["selected_crops"])
+            if "crops" in raw and isinstance(raw["crops"], list):
+                raw["crops"] = sorted(raw["crops"])
+
         serialized = json.dumps(raw, sort_keys=True, default=str)
         digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
         return f"{prefix}:{digest}"
 
     def get(self, key: str) -> Optional[Any]:
-        """Retrieve cached value if present, moving it to MRU."""
+        """Retrieve cached value if present, moving it to MRU and returning an isolated deep copy."""
         with self._lock:
             if key not in self._cache:
                 return None
             self._cache.move_to_end(key)
-            return self._cache[key]
+            return copy.deepcopy(self._cache[key])
 
     def set(self, key: str, value: Any) -> None:
-        """Store value in cache, evicting LRU item if capacity is exceeded."""
+        """Store deep copy of value in cache, evicting LRU item if capacity is exceeded."""
         with self._lock:
             if key in self._cache:
                 self._cache.move_to_end(key)
-            self._cache[key] = value
+            self._cache[key] = copy.deepcopy(value)
             if len(self._cache) > self.maxsize:
                 self._cache.popitem(last=False)
 

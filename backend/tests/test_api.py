@@ -14,11 +14,22 @@ Tests all required endpoints and edge cases using FastAPI TestClient:
 11. Caching of identical scenario requests.
 12. OpenAPI and Swagger documentation availability.
 """
+import threading
 import pytest
 from starlette.testclient import TestClient
 
+from backend.app.core.cache import ScenarioCache, scenario_cache
 from backend.app.main import app
+from backend.app.ml.predictor import AquaShiftPredictor
+from backend.app.models.schemas import (
+    BatchPredictionRequest,
+    OptimizationRequest,
+    OptimizationWeights,
+    SweepRequest,
+)
 from backend.app.optimizer import AquaShiftOptimizer
+from backend.app.optimizer.stress import AquaShiftStressTester
+from backend.app.optimizer.sweep import AquaShiftWaterSweep
 
 client = TestClient(app)
 
@@ -361,3 +372,275 @@ def test_12_docs_and_openapi_endpoints():
     assert "/api/optimize" in paths
     assert "/api/stress-test" in paths
     assert "/api/simulate/sweep" in paths
+
+
+# -----------------------------------------------------------------------------
+# Phase 4 Targeted Audit: Numerical Consistency, Regression, Caching & Sweeps
+# -----------------------------------------------------------------------------
+
+def test_13_canonical_baseline_regression_and_kpis():
+    """13. Regression: Verify /api/baseline exactly matches the canonical 7 ha Paddy + 3 ha Maize baseline."""
+    res = client.get("/api/baseline?total_land_ha=10.0")
+    assert res.status_code == 200
+    data = res.json()
+
+    # 1. Exact crop allocation verification
+    alloc_map = {a["crop_id"]: a for a in data["allocations"]}
+    assert len(alloc_map) == 5
+    assert alloc_map["paddy"]["allocated_ha"] == 7.0
+    assert alloc_map["paddy"]["land_percentage"] == 70.0
+    assert alloc_map["maize"]["allocated_ha"] == 3.0
+    assert alloc_map["maize"]["land_percentage"] == 30.0
+    assert alloc_map["wheat"]["allocated_ha"] == 0.0
+    assert alloc_map["pulses"]["allocated_ha"] == 0.0
+    assert alloc_map["millets"]["allocated_ha"] == 0.0
+
+    # 2. Exact KPI values
+    assert abs(data["total_food_kcal"] - 162750000.0) < 1e-1
+    assert abs(data["total_water_use_m3"] - 104127.3) < 1e-1
+    assert abs(data["total_gross_revenue_inr"] - 985110.0) < 1e-1
+    assert abs(data["total_cultivation_cost_inr"] - 344000.0) < 1e-1
+    assert abs(data["total_net_income_inr"] - 641110.0) < 1e-1
+
+    # 3. Direct comparison with optimizer engine
+    opt = AquaShiftOptimizer()
+    areas, metrics = opt.calculate_baseline(10.0, "normal", 1.0, opt.all_crops)
+    assert areas["paddy"] == 7.0
+    assert areas["maize"] == 3.0
+    assert abs(data["total_food_kcal"] - metrics["total_food_kcal"]) < 1e-3
+    assert abs(data["total_water_use_m3"] - metrics["total_water_use_m3"]) < 1e-3
+    assert abs(data["total_net_income_inr"] - metrics["total_net_income_inr"]) < 1e-3
+
+    # 4. Alignment with /api/config baseline assumptions
+    cfg_res = client.get("/api/config")
+    assert cfg_res.status_code == 200
+    cfg_base = cfg_res.json()["baseline_assumptions"]
+    assert cfg_base["paddy_share"] == 0.70
+    assert cfg_base["maize_share"] == 0.30
+    assert abs(cfg_base["baseline_water_m3"] - 104127.3) < 1e-1
+    assert abs(cfg_base["baseline_food_kcal"] - 162750000.0) < 1e-1
+    assert abs(cfg_base["baseline_net_income_inr"] - 641110.0) < 1e-1
+
+
+def test_14_numerical_parity_predict_endpoint():
+    """14. Numerical parity: /api/predict matches AquaShiftPredictor for identical inputs within 1e-4."""
+    predictor = AquaShiftPredictor()
+    scenarios = ["normal", "deficit", "severe_deficit", "surplus"]
+    ratios = [0.4, 0.8, 1.0]
+
+    for sc in scenarios:
+        for r in ratios:
+            payload = {"rainfall_scenario": sc, "water_availability_ratio": r}
+            res = client.post("/api/predict", json=payload)
+            assert res.status_code == 200
+            api_preds = res.json()["predictions"]
+
+            core_preds = predictor.predict_all_crops(
+                rainfall_scenario=sc,
+                water_availability_ratio=r,
+            ).predictions
+
+            for cid, cp in core_preds.items():
+                ap = api_preds[cid]
+                assert abs(ap["predicted_yield_t_ha"] - cp.predicted_yield_t_ha) < 1e-4
+                assert abs(ap["predicted_water_demand_m3_ha"] - cp.predicted_water_demand_m3_ha) < 1e-4
+                assert abs(ap["yield_range_lower"] - cp.yield_range_lower) < 1e-4
+                assert abs(ap["yield_range_upper"] - cp.yield_range_upper) < 1e-4
+                assert abs(ap["water_range_lower"] - cp.water_range_lower) < 1e-4
+                assert abs(ap["water_range_upper"] - cp.water_range_upper) < 1e-4
+
+
+def test_15_numerical_parity_optimize_endpoint():
+    """15. Numerical parity: /api/optimize matches AquaShiftOptimizer outputs within 1e-3."""
+    opt = AquaShiftOptimizer()
+
+    test_cases = [
+        OptimizationRequest(
+            total_land_ha=12.0,
+            water_budget_reduction_pct=20.0,
+            rainfall_scenario="normal",
+            optimization_mode="weighted",
+            weights=OptimizationWeights(water=0.5, food=0.3, income=0.2),
+        ),
+        OptimizationRequest(
+            total_land_ha=8.0,
+            water_budget_reduction_pct=35.0,
+            rainfall_scenario="deficit",
+            optimization_mode="lexicographic",
+            priorities=["water", "income", "food"],
+        ),
+    ]
+
+    for req in test_cases:
+        res = client.post("/api/optimize", json=req.model_dump())
+        assert res.status_code == 200
+        api_data = res.json()
+
+        core_res = opt.optimize(req)
+
+        # Compare solver status and KPIs
+        assert api_data["solver_status"] == core_res.solver_status
+        assert abs(api_data["total_water_use_m3"] - core_res.total_water_use_m3) < 1e-3
+        assert abs(api_data["water_slack_m3"] - core_res.water_slack_m3) < 1e-3
+        assert abs(api_data["total_food_kcal"] - core_res.total_food_kcal) < 1e-3
+        assert abs(api_data["food_slack_kcal"] - core_res.food_slack_kcal) < 1e-3
+        assert abs(api_data["total_net_income_inr"] - core_res.total_net_income_inr) < 1e-3
+        assert abs(api_data["income_slack_inr"] - core_res.income_slack_inr) < 1e-3
+        assert abs(api_data["objective_value"] - core_res.objective_value) < 1e-3
+
+        # Compare allocations
+        api_alloc = {a["crop_id"]: a["allocated_ha"] for a in api_data["allocations"]}
+        core_alloc = {a.crop_id: a.allocated_ha for a in core_res.allocations}
+        for cid, area in core_alloc.items():
+            assert abs(api_alloc[cid] - area) < 1e-3
+
+        # Compare diagnosis
+        assert api_data["diagnosis"]["all_targets_met"] == core_res.diagnosis.all_targets_met
+        assert api_data["diagnosis"]["primary_bottleneck"] == core_res.diagnosis.primary_bottleneck
+
+
+def test_16_numerical_parity_stress_endpoint():
+    """16. Numerical parity: /api/stress-test matches AquaShiftStressTester within 1e-3."""
+    tester = AquaShiftStressTester()
+
+    res = client.post("/api/stress-test", json={})
+    assert res.status_code == 200
+    api_data = res.json()
+
+    core_res = tester.run_stress_test(request=None)
+
+    assert api_data["strict_solve_status"] == core_res.strict_solve_status
+    assert api_data["recovery_solve_status"] == core_res.recovery_solve_status
+    assert api_data["individual_feasibility"] == core_res.individual_feasibility
+
+    api_plan = api_data["closest_feasible_plan"]
+    core_plan = core_res.closest_feasible_plan
+    assert abs(api_plan["total_water_use_m3"] - core_plan.total_water_use_m3) < 1e-3
+    assert abs(api_plan["water_slack_m3"] - core_plan.water_slack_m3) < 1e-3
+    assert abs(api_plan["total_food_kcal"] - core_plan.total_food_kcal) < 1e-3
+    assert abs(api_plan["food_slack_kcal"] - core_plan.food_slack_kcal) < 1e-3
+    assert abs(api_plan["total_net_income_inr"] - core_plan.total_net_income_inr) < 1e-3
+    assert abs(api_plan["income_slack_inr"] - core_plan.income_slack_inr) < 1e-3
+
+
+def test_17_numerical_parity_sweep_endpoint():
+    """17. Numerical parity: /api/simulate/sweep matches AquaShiftWaterSweep point-by-point."""
+    sw = AquaShiftWaterSweep()
+    req = SweepRequest(total_land_ha=10.0, rainfall_scenario="normal", start_ratio=1.0, end_ratio=0.5, step=0.1)
+
+    res = client.post("/api/simulate/sweep", json=req.model_dump())
+    assert res.status_code == 200
+    api_data = res.json()
+
+    core_res = sw.run_sweep(request=req)
+
+    assert len(api_data["points"]) == len(core_res.points)
+    assert api_data["tipping_point_water_ratio"] == core_res.tipping_point_water_ratio
+
+    for p_api, p_core in zip(api_data["points"], core_res.points):
+        assert abs(p_api["water_availability_ratio"] - p_core.water_availability_ratio) < 1e-4
+        assert abs(p_api["water_budget_m3"] - p_core.water_budget_m3) < 1e-3
+        assert abs(p_api["total_water_use_m3"] - p_core.total_water_use_m3) < 1e-3
+        assert abs(p_api["water_slack_m3"] - p_core.water_slack_m3) < 1e-3
+        assert abs(p_api["total_food_kcal"] - p_core.total_food_kcal) < 1e-3
+        assert abs(p_api["food_slack_kcal"] - p_core.food_slack_kcal) < 1e-3
+        assert abs(p_api["total_net_income_inr"] - p_core.total_net_income_inr) < 1e-3
+        assert abs(p_api["income_slack_inr"] - p_core.income_slack_inr) < 1e-3
+        assert p_api["all_targets_met"] == p_core.all_targets_met
+        assert p_api["primary_bottleneck"] == p_core.primary_bottleneck
+
+
+def test_18_cache_key_isolation_and_immutability():
+    """18. Cache audit: Key differentiation across modes/weights/scenarios and caller mutation isolation."""
+    cache = ScenarioCache(maxsize=16)
+
+    # 1. Key differentiation across optimization modes
+    req_weighted = OptimizationRequest(total_land_ha=10.0, optimization_mode="weighted")
+    req_lexico = OptimizationRequest(total_land_ha=10.0, optimization_mode="lexicographic")
+    key_w = cache.make_key("opt", req_weighted)
+    key_l = cache.make_key("opt", req_lexico)
+    assert key_w != key_l, "Different optimization modes must have distinct cache keys"
+
+    # 2. Key differentiation across priority weights
+    req_w1 = OptimizationRequest(total_land_ha=10.0, weights=OptimizationWeights(water=0.8, food=0.1, income=0.1))
+    req_w2 = OptimizationRequest(total_land_ha=10.0, weights=OptimizationWeights(water=0.2, food=0.4, income=0.4))
+    assert cache.make_key("opt", req_w1) != cache.make_key("opt", req_w2), "Different weights must have distinct cache keys"
+
+    # 3. Key differentiation across rainfall scenarios
+    req_norm = OptimizationRequest(total_land_ha=10.0, rainfall_scenario="normal")
+    req_def = OptimizationRequest(total_land_ha=10.0, rainfall_scenario="deficit")
+    assert cache.make_key("opt", req_norm) != cache.make_key("opt", req_def), "Different rainfall scenarios must have distinct cache keys"
+
+    # 4. Key differentiation across water budgets
+    req_b1 = OptimizationRequest(total_land_ha=10.0, water_budget_m3=80000.0)
+    req_b2 = OptimizationRequest(total_land_ha=10.0, water_budget_m3=100000.0)
+    assert cache.make_key("opt", req_b1) != cache.make_key("opt", req_b2), "Different water budgets must have distinct cache keys"
+
+    # 5. Caller mutation isolation: modifying returned object does not taint cache
+    test_obj = {"result": 42, "nested": {"alloc": 7.0}}
+    cache.set("test_key", test_obj)
+
+    retrieved_1 = cache.get("test_key")
+    retrieved_1["result"] = 999
+    retrieved_1["nested"]["alloc"] = -1.0
+
+    retrieved_2 = cache.get("test_key")
+    assert retrieved_2["result"] == 42, "Mutating a cached object copy must NOT corrupt subsequent cache retrievals"
+    assert retrieved_2["nested"]["alloc"] == 7.0
+
+    # 6. Post-set mutation isolation: mutating original object does not taint cache
+    original_obj = {"val": [1, 2, 3]}
+    cache.set("orig_key", original_obj)
+    original_obj["val"].append(999)
+    assert cache.get("orig_key")["val"] == [1, 2, 3]
+
+    # 7. Thread-safety test
+    def worker(idx: int):
+        for i in range(50):
+            k = f"k_{idx}_{i % 5}"
+            cache.set(k, {"worker": idx, "i": i})
+            _ = cache.get(k)
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert cache.size() <= 16
+
+
+def test_19_sweep_monotonic_ordering_ascending_and_descending():
+    """19. Sweep correctness: Monotonic ordering for both descending and ascending configurations."""
+    # Descending: 1.0 down to 0.2
+    res_desc = client.post(
+        "/api/simulate/sweep",
+        json={"total_land_ha": 10.0, "start_ratio": 1.0, "end_ratio": 0.2, "step": 0.1},
+    )
+    assert res_desc.status_code == 200
+    points_desc = res_desc.json()["points"]
+    assert len(points_desc) == 9
+    ratios_desc = [p["water_availability_ratio"] for p in points_desc]
+    assert ratios_desc == sorted(ratios_desc, reverse=True)
+    assert ratios_desc[0] == 1.0
+    assert ratios_desc[-1] == 0.2
+
+    # Ascending: 0.2 up to 1.0
+    res_asc = client.post(
+        "/api/simulate/sweep",
+        json={"total_land_ha": 10.0, "start_ratio": 0.2, "end_ratio": 1.0, "step": 0.1},
+    )
+    assert res_asc.status_code == 200
+    points_asc = res_asc.json()["points"]
+    assert len(points_asc) == 9
+    ratios_asc = [p["water_availability_ratio"] for p in points_asc]
+    assert ratios_asc == sorted(ratios_asc)
+    assert ratios_asc[0] == 0.2
+    assert ratios_asc[-1] == 1.0
+
+    # Infeasibility & slack honesty
+    # At ratio 0.2, water is severe; must report all_targets_met=False
+    low_water_pt = points_asc[0]
+    assert low_water_pt["all_targets_met"] is False
+    assert low_water_pt["water_slack_m3"] > 0.0 or low_water_pt["food_slack_kcal"] > 0.0
+

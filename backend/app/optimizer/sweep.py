@@ -47,12 +47,18 @@ class AquaShiftWaterSweep:
         b_food = baseline["total_food_kcal"]
         b_income = baseline["total_net_income_inr"]
 
-        # 2. Generate monotonically decreasing ratios from start_ratio down to end_ratio
+        # 2. Generate ratios respecting requested order (descending or ascending)
         ratios = []
-        cur = req.start_ratio
-        while cur >= req.end_ratio - 1e-5:
-            ratios.append(round(cur, 2))
-            cur -= req.step
+        if req.start_ratio >= req.end_ratio:
+            cur = req.start_ratio
+            while cur >= req.end_ratio - 1e-5:
+                ratios.append(round(cur, 4))
+                cur -= req.step
+        else:
+            cur = req.start_ratio
+            while cur <= req.end_ratio + 1e-5:
+                ratios.append(round(cur, 4))
+                cur += req.step
 
         points: List[SweepPoint] = []
         tipping_point_ratio: Optional[float] = None
