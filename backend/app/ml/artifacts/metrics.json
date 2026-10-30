@@ -1,0 +1,67 @@
+{
+  "seed": 42,
+  "yield_model": {
+    "features": [
+      "baseline_yield_t_ha",
+      "drought_sensitivity_ky",
+      "yield_stress_multiplier",
+      "effective_rainfall_multiplier",
+      "water_availability_ratio"
+    ],
+    "monotonic_constraints": [
+      1,
+      0,
+      1,
+      1,
+      1
+    ],
+    "random_split_80_20": {
+      "mae": 0.072,
+      "rmse": 0.0943,
+      "r2": 0.9944,
+      "train_samples": 1600,
+      "val_samples": 400
+    },
+    "contiguous_block_holdout": {
+      "held_out_intervals": [
+        "[0.35, 0.45]",
+        "[0.75, 0.85]"
+      ],
+      "mae": 0.1557,
+      "rmse": 0.2008,
+      "r2": 0.9626,
+      "train_samples": 1620,
+      "val_samples": 380
+    },
+    "rmse": 0.2008,
+    "mae": 0.1557
+  },
+  "water_demand_model": {
+    "features": [
+      "seasonal_water_m3_ha",
+      "effective_rainfall_multiplier"
+    ],
+    "monotonic_constraints": [
+      1,
+      -1
+    ],
+    "random_split_80_20": {
+      "mae": 66.5212,
+      "rmse": 98.8802,
+      "r2": 0.9992,
+      "train_samples": 1600,
+      "val_samples": 400
+    },
+    "scenario_holdout": {
+      "held_out_scenario": "deficit",
+      "mae": 409.926,
+      "rmse": 497.4376,
+      "r2": 0.9841,
+      "train_samples": 1500,
+      "val_samples": 500
+    },
+    "rmse": 98.8802,
+    "mae": 66.5212
+  },
+  "disclosure": "Validation metrics evaluated on synthetic demo data calibrated to public statistics; not real-world field trial accuracy."
+}

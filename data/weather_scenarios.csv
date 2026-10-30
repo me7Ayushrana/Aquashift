@@ -1,0 +1,5 @@
+scenario_id,scenario_name,effective_rainfall_multiplier,yield_stress_multiplier,description
+normal,Normal,1.00,1.00,Baseline historical rainfall and seasonal atmospheric demand.
+deficit,Deficit,0.70,0.85,Moderate monsoon deficit resulting in a 30% reduction in effective rainfall.
+severe_deficit,Severe Deficit,0.40,0.65,Severe drought with 60% rainfall reduction and high vapor pressure deficit.
+surplus,Surplus,1.25,1.05,Above-average rainfall with 25% surplus soil moisture recharge.
