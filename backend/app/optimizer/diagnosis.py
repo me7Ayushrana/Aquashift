@@ -38,9 +38,10 @@ class AquaShiftDiagnostician:
         - Severity Tiers:
           - Critical (Weight 4): Absolute physical resource boundary violation (e.g. min_feasible_water > budget),
             or water slack >= 30% of budget.
-          - High (Weight 3): Economic crisis (income_achieved < 0 or max_feasible_income < 0), or large shortfall >= 40%.
-          - Moderate (Weight 2): Noticeable deficit (slack > 0), but farm produces positive output / food sustenance.
-          - Satisfied (Weight 1): Shortfall <= 0.
+          - High (Weight 3): Economic crisis (income_achieved < 0 or max_feasible_income < 0), large income shortfall >= 40%,
+            or food normalized shortfall >= 50%.
+          - Moderate (Weight 2): Noticeable deficit (slack > tolerance), but below high threshold (food shortfall < 50%, income shortfall < 40%).
+          - Satisfied (Weight 1): Slack within numerical tolerance (water <= 0.1 m³, food <= 1000 kcal, income <= ₹1.0).
         - Rank Score Formula:
             rank_score = severity_weight * 1000 + (500 if is_physical_barrier else 0) + min(slack_percentage, 100.0)
           Dimensions are sorted by rank_score descending.
@@ -121,13 +122,6 @@ class AquaShiftDiagnostician:
         if food_slack_kcal <= 1000.0:
             food_severity = "Satisfied"
             food_exp = "Target nutritional calorie production is fully met."
-        elif food_achieved_kcal > 0 and income_achieved_inr < 0:
-            # Calorie production remains positive, providing basic sustenance during an economic crisis
-            food_severity = "Moderate"
-            food_exp = (
-                f"Caloric production shortfall of {food_slack_kcal:,.0f} kcal ({food_slack_pct:.1f}% below target). "
-                f"While grain output is reduced, basic nutritional sustenance ({food_achieved_kcal:,.0f} kcal) is maintained."
-            )
         elif food_slack_pct >= 50.0:
             food_severity = "High"
             food_exp = f"High food caloric shortfall of {food_slack_kcal:,.0f} kcal ({food_slack_pct:.1f}% below target)."

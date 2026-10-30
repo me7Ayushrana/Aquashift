@@ -25,6 +25,7 @@ from backend.app.models.schemas import (
     OptimizationWeights,
 )
 from backend.app.optimizer import (
+    AquaShiftDiagnostician,
     AquaShiftOptimizer,
     AquaShiftStressTester,
     OptimizationValidationException,
@@ -449,7 +450,7 @@ def test_14_extreme_scenario_stress_test(optimizer: AquaShiftOptimizer):
     ranks = {b.rank: (b.dimension, b.severity) for b in diag.bottleneck_ranking}
     assert ranks[1] == ("Water", "Critical")
     assert ranks[2] == ("Income", "High")
-    assert ranks[3] == ("Food", "Moderate")
+    assert ranks[3] == ("Food", "High")
 
     # Verify sensitivity label
     for sens in plan.local_sensitivities:
@@ -582,3 +583,216 @@ def test_17_lexicographic_tolerance_and_multistage_preservation(optimizer: AquaS
     # Verify that returned allocations match the reported metrics
     computed_water = sum(a.allocated_ha * a.predicted_water_demand_m3_ha for a in res.allocations)
     assert abs(res.total_water_use_m3 - computed_water) < 1.0
+
+
+# -----------------------------------------------------------------------------
+# Test 18: Food Severity Classification Rules & Independence from Farm Income
+# -----------------------------------------------------------------------------
+def test_18_food_severity_classification_rules():
+    """18. Tests food severity classification:
+    - Satisfied: slack <= 1000 kcal tolerance
+    - Moderate: 0 < shortfall < 50%
+    - High: shortfall >= 50%
+    - Independence: food severity must not be downgraded merely because income is negative.
+    Tests all 5 required conditions:
+    1. Food shortfall of 10% -> Moderate
+    2. Food shortfall of 50% -> High
+    3. Food shortfall of 95% -> High
+    4. Food shortfall of 95% while income is negative -> High
+    5. All targets satisfied -> Satisfied
+    """
+    # 1. Food shortfall of 10% (moderate)
+    diag_10 = AquaShiftDiagnostician.diagnose(
+        allocations=[],
+        water_achieved_m3=50000.0,
+        water_budget_m3=50000.0,
+        water_slack_m3=0.0,
+        food_achieved_kcal=90000000.0,
+        food_target_kcal=100000000.0,
+        food_slack_kcal=10000000.0,  # 10% shortfall
+        income_achieved_inr=500000.0,
+        income_target_inr=500000.0,
+        income_slack_inr=0.0,
+        min_feasible_water_m3=30000.0,
+        binding_constraints=[],
+    )
+    food_rank_10 = next(b for b in diag_10.bottleneck_ranking if b.dimension == "Food")
+    assert food_rank_10.severity == "Moderate"
+    assert food_rank_10.slack_percentage == 10.0
+
+    # 2. Food shortfall of 50% (high threshold boundary)
+    diag_50 = AquaShiftDiagnostician.diagnose(
+        allocations=[],
+        water_achieved_m3=50000.0,
+        water_budget_m3=50000.0,
+        water_slack_m3=0.0,
+        food_achieved_kcal=50000000.0,
+        food_target_kcal=100000000.0,
+        food_slack_kcal=50000000.0,  # 50% shortfall
+        income_achieved_inr=500000.0,
+        income_target_inr=500000.0,
+        income_slack_inr=0.0,
+        min_feasible_water_m3=30000.0,
+        binding_constraints=[],
+    )
+    food_rank_50 = next(b for b in diag_50.bottleneck_ranking if b.dimension == "Food")
+    assert food_rank_50.severity == "High"
+    assert food_rank_50.slack_percentage == 50.0
+
+    # 3. Food shortfall of 95% (high)
+    diag_95 = AquaShiftDiagnostician.diagnose(
+        allocations=[],
+        water_achieved_m3=50000.0,
+        water_budget_m3=50000.0,
+        water_slack_m3=0.0,
+        food_achieved_kcal=5000000.0,
+        food_target_kcal=100000000.0,
+        food_slack_kcal=95000000.0,  # 95% shortfall
+        income_achieved_inr=500000.0,
+        income_target_inr=500000.0,
+        income_slack_inr=0.0,
+        min_feasible_water_m3=30000.0,
+        binding_constraints=[],
+    )
+    food_rank_95 = next(b for b in diag_95.bottleneck_ranking if b.dimension == "Food")
+    assert food_rank_95.severity == "High"
+    assert food_rank_95.slack_percentage == 95.0
+
+    # 4. Food shortfall of 95% while income is negative (must NOT be downgraded to Moderate)
+    diag_95_neg_inc = AquaShiftDiagnostician.diagnose(
+        allocations=[],
+        water_achieved_m3=20000.0,
+        water_budget_m3=10000.0,
+        water_slack_m3=10000.0,
+        food_achieved_kcal=5000000.0,
+        food_target_kcal=100000000.0,
+        food_slack_kcal=95000000.0,  # 95% shortfall
+        income_achieved_inr=-150000.0,  # negative income!
+        income_target_inr=500000.0,
+        income_slack_inr=650000.0,
+        min_feasible_water_m3=25000.0,
+        binding_constraints=[],
+    )
+    food_rank_neg = next(b for b in diag_95_neg_inc.bottleneck_ranking if b.dimension == "Food")
+    assert food_rank_neg.severity == "High", "Food shortfall of 95% must remain High even when income is negative"
+    assert food_rank_neg.slack_percentage == 95.0
+
+    # 5. All targets satisfied (slack <= tolerance)
+    diag_sat = AquaShiftDiagnostician.diagnose(
+        allocations=[],
+        water_achieved_m3=40000.0,
+        water_budget_m3=50000.0,
+        water_slack_m3=0.0,
+        food_achieved_kcal=105000000.0,
+        food_target_kcal=100000000.0,
+        food_slack_kcal=0.0,
+        income_achieved_inr=550000.0,
+        income_target_inr=500000.0,
+        income_slack_inr=0.0,
+        min_feasible_water_m3=30000.0,
+        binding_constraints=[],
+    )
+    assert diag_sat.all_targets_met is True
+    assert diag_sat.primary_bottleneck is None
+    for b in diag_sat.bottleneck_ranking:
+        assert b.severity == "Satisfied"
+        assert b.slack_amount == 0.0
+
+
+# -----------------------------------------------------------------------------
+# Test 19: End-to-End Food Units, Feasibility Boundaries and Consistency
+# -----------------------------------------------------------------------------
+def test_19_food_units_and_feasibility_boundaries(optimizer: AquaShiftOptimizer):
+    """19. Audits food units end-to-end:
+    - Verifies formula: Food (kcal) = area (ha) * yield (t/ha) * 1000 (kg/t) * cal (kcal/kg).
+    - Verifies normal baseline food of 162.75M kcal and +10% target of 179.025M kcal.
+    - Verifies maximum achievable food under severe drought is 19.30M kcal (19,299,400 kcal)
+      derived from 8 ha wheat + 2 ha millets.
+    - Verifies mathematical consistency between optimizer and stress-test boundaries.
+    """
+    # 1. Food production unit audit across allocations
+    req = OptimizationRequest(
+        total_land_ha=10.0,
+        rainfall_scenario="normal",
+        water_availability_ratio=1.0,
+    )
+    res = optimizer.optimize(req)
+
+    # Check each individual crop allocation
+    computed_total_food = 0.0
+    for a in res.allocations:
+        cal_kg = float(optimizer.crops_df.loc[a.crop_id, "calories_kcal_kg"])
+        # Production in tonnes: area (ha) * yield (t/ha) rounded to kg precision (3 decimal places)
+        expected_tonnes = round(a.allocated_ha * a.predicted_yield_t_ha, 3)
+        assert abs(a.production_tonnes - expected_tonnes) < 1e-4
+
+        # Food calories (kcal): production_tonnes * 1000 (kg/tonne) * calories (kcal/kg)
+        expected_food_from_prod = round(a.production_tonnes * 1000.0 * cal_kg, 1)
+        assert abs(a.food_calories_kcal - expected_food_from_prod) < 1.0
+
+        # Direct unrounded formula matches within 0.0005 t (0.5 kg) * cal_kg
+        direct_formula = a.allocated_ha * a.predicted_yield_t_ha * 1000.0 * cal_kg
+        assert abs(a.food_calories_kcal - direct_formula) <= (cal_kg * 0.5 + 1.0)
+
+        computed_total_food += a.food_calories_kcal
+
+    assert abs(res.total_food_kcal - computed_total_food) < 1.0
+
+    # 2. Baseline food and target calculation
+    _, baseline = optimizer.calculate_baseline(
+        total_land_ha=10.0,
+        rainfall_scenario="normal",
+        water_availability_ratio=1.0,
+        selected_crops=["paddy", "wheat", "maize", "pulses", "millets"],
+    )
+    # Baseline: 7 ha paddy (7 * 4.755 * 1000 * 3600 = 119.826M) + 3 ha maize (3 * 3.920 * 1000 * 3650 = 42.924M) = 162.75M kcal
+    assert baseline["total_food_kcal"] == 162750000.0, f"Expected 162.75M kcal baseline, got {baseline['total_food_kcal']}"
+
+    # Target calculation with +10% increase
+    req_target_pct = OptimizationRequest(
+        total_land_ha=10.0,
+        rainfall_scenario="normal",
+        water_availability_ratio=1.0,
+        food_target_increase_pct=10.0,
+    )
+    res_target = optimizer.optimize(req_target_pct)
+    expected_target = round(162750000.0 * 1.10, 1)  # 179,025,000.0 kcal
+    assert res_target.food_target_kcal == expected_target
+
+    # 3. Maximum achievable food boundary under severe drought
+    # ML predictions under severe deficit (ratio=0.20):
+    # wheat: 0.587 t/ha * 1000 * 3400 = 1,995,800 kcal/ha (max share 80% = 8.0 ha) -> 15,966,400 kcal
+    # millets: 0.505 t/ha * 1000 * 3300 = 1,666,500 kcal/ha (remaining 20% = 2.0 ha) -> 3,333,000 kcal
+    # All other crops: yield = 0.05 t/ha -> caloric density < 185,000 kcal/ha
+    # Total analytical max food = 15,966,400 + 3,333,000 = 19,299,400 kcal (19.30M kcal)
+    severe_preds = optimizer.predictor.predict_all_crops(
+        rainfall_scenario="severe_deficit",
+        water_availability_ratio=0.20,
+        crops=["paddy", "wheat", "maize", "pulses", "millets"],
+    ).predictions
+
+    severe_food_coeffs = {
+        c: severe_preds[c].predicted_yield_t_ha * 1000.0 * float(optimizer.crops_df.loc[c, "calories_kcal_kg"])
+        for c in ["paddy", "wheat", "maize", "pulses", "millets"]
+    }
+    max_food_drought = optimizer.calculate_maximum_feasible_food(
+        total_land_ha=10.0,
+        selected_crops=["paddy", "wheat", "maize", "pulses", "millets"],
+        predicted_food_coeffs=severe_food_coeffs,
+    )
+    assert abs(max_food_drought - 19299400.0) < 1.0, f"Expected 19.30M kcal (19,299,400), got {max_food_drought}"
+
+    # 4. Consistency between optimizer and stress-test calculations
+    tester = AquaShiftStressTester(optimizer=optimizer)
+    stress_res = tester.run_stress_test()
+
+    assert abs(stress_res.target_boundaries["food"]["max_achievable"] - max_food_drought) < 1.0
+    assert stress_res.target_boundaries["food"]["target"] == expected_target
+
+    # Verify slack consistency: slack = max(0.0, target - achieved)
+    plan = stress_res.closest_feasible_plan
+    expected_slack = round(max(0.0, plan.food_target_kcal - plan.total_food_kcal), 1)
+    assert abs(plan.food_slack_kcal - expected_slack) < 1.0
+    expected_shortfall_pct = round((expected_slack / plan.food_target_kcal) * 100.0, 1)
+    assert abs(plan.food_shortfall_pct - expected_shortfall_pct) < 0.2
+
