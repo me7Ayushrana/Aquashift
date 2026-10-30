@@ -6,11 +6,11 @@ client = TestClient(app)
 
 
 def test_health_endpoint():
-    """Verify that GET /api/health returns HTTP 200 and {'status': 'ok'}."""
+    """Verify that GET /api/health returns HTTP 200 and status 'ok'."""
     response = client.get("/api/health")
     assert response.status_code == 200
     data = response.json()
-    assert data == {"status": "ok"}
+    assert data["status"] == "ok"
 
 
 def test_root_endpoint():

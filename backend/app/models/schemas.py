@@ -7,6 +7,9 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 class HealthResponse(BaseModel):
     """Health check response schema."""
     status: str = Field(default="ok", description="Service health status")
+    version: str = Field(default="0.1.0", description="Application version")
+    service: str = Field(default="AquaShift Backend", description="Service name")
+    offline_mode: bool = Field(default=True, description="Whether core services operate fully offline")
 
 
 class CropPredictionRequest(BaseModel):
@@ -28,7 +31,11 @@ class CropPredictionRequest(BaseModel):
     @field_validator("rainfall_scenario")
     @classmethod
     def normalize_scenario(cls, v: str) -> str:
-        return v.strip().lower()
+        val = v.strip().lower()
+        allowed = {"normal", "deficit", "severe_deficit", "surplus"}
+        if val not in allowed:
+            raise ValueError(f"Unknown rainfall_scenario '{v}'. Allowed: {sorted(list(allowed))}")
+        return val
 
 
 class CropPrediction(BaseModel):
@@ -78,9 +85,9 @@ class CropPrediction(BaseModel):
 
 class BatchPredictionRequest(BaseModel):
     """Request payload for multi-crop prediction under a scenario."""
-    rainfall_scenario: str = Field(..., description="Rainfall scenario")
+    rainfall_scenario: str = Field(default="normal", description="Rainfall scenario (normal, deficit, severe_deficit, surplus)")
     water_availability_ratio: float = Field(
-        ...,
+        default=1.0,
         ge=0.05,
         le=2.0,
         description="Relative irrigation water availability ratio",
@@ -93,7 +100,27 @@ class BatchPredictionRequest(BaseModel):
     @field_validator("rainfall_scenario")
     @classmethod
     def normalize_scenario(cls, v: str) -> str:
-        return v.strip().lower()
+        val = v.strip().lower()
+        allowed = {"normal", "deficit", "severe_deficit", "surplus"}
+        if val not in allowed:
+            raise ValueError(f"Unknown rainfall_scenario '{v}'. Allowed: {sorted(list(allowed))}")
+        return val
+
+    @field_validator("crops")
+    @classmethod
+    def validate_crops(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        if v is not None:
+            if len(v) == 0:
+                raise ValueError("crops list cannot be empty.")
+            allowed = {"paddy", "wheat", "maize", "pulses", "millets"}
+            cleaned = []
+            for c in v:
+                norm = c.strip().lower()
+                if norm not in allowed:
+                    raise ValueError(f"Unknown crop '{c}'. Allowed crops: {sorted(list(allowed))}")
+                cleaned.append(norm)
+            return cleaned
+        return v
 
 
 class BatchPredictionResponse(BaseModel):
@@ -101,6 +128,16 @@ class BatchPredictionResponse(BaseModel):
     rainfall_scenario: str
     water_availability_ratio: float
     predictions: Dict[str, CropPrediction]
+    units: Dict[str, str] = Field(
+        default_factory=lambda: {
+            "yield": "tonnes/hectare (t/ha)",
+            "water_demand": "m³/hectare",
+            "water_availability_ratio": "ratio [0.05, 2.0]",
+        }
+    )
+    uncertainty_note: str = Field(
+        default="Error margins represent indicative validation residual spread (±1.96 * RMSE), not calibrated confidence intervals."
+    )
 
 
 # =============================================================================
@@ -247,7 +284,27 @@ class OptimizationRequest(BaseModel):
     @field_validator("rainfall_scenario")
     @classmethod
     def normalize_scenario(cls, v: str) -> str:
-        return v.strip().lower()
+        val = v.strip().lower()
+        allowed = {"normal", "deficit", "severe_deficit", "surplus"}
+        if val not in allowed:
+            raise ValueError(f"Unknown rainfall_scenario '{v}'. Allowed: {sorted(list(allowed))}")
+        return val
+
+    @field_validator("selected_crops")
+    @classmethod
+    def validate_crops(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        if v is not None:
+            if len(v) == 0:
+                raise ValueError("selected_crops cannot be empty.")
+            allowed = {"paddy", "wheat", "maize", "pulses", "millets"}
+            cleaned = []
+            for c in v:
+                norm = c.strip().lower()
+                if norm not in allowed:
+                    raise ValueError(f"Unknown crop '{c}'. Allowed crops: {sorted(list(allowed))}")
+                cleaned.append(norm)
+            return cleaned
+        return v
 
 
 class OptimizationResponse(BaseModel):
@@ -313,3 +370,129 @@ class OptimizationValidationResult(BaseModel):
     error_code: Optional[str] = Field(default=None, description="Error code identifier")
     message: Optional[str] = Field(default=None, description="Detailed validation error message")
     conflicting_constraints: List[str] = Field(default_factory=list, description="List of conflicting constraint names")
+
+
+# =============================================================================
+# Configuration & Baseline Schemas (Phase 4)
+# =============================================================================
+
+class CropConstraintConfig(BaseModel):
+    """Crop agronomic profile and land share bounds."""
+    crop_id: str
+    crop_name: str
+    baseline_yield_t_ha: float
+    seasonal_water_m3_ha: float
+    cultivation_cost_inr_ha: float
+    price_inr_quintal: float
+    calories_kcal_kg: float
+    drought_sensitivity_ky: float
+    min_land_share: float
+    max_land_share: float
+
+
+class WeatherScenarioConfig(BaseModel):
+    """Meteorological scenario configuration parameters."""
+    scenario_id: str
+    scenario_name: str
+    effective_rainfall_multiplier: float
+    yield_stress_multiplier: float
+    description: str
+
+
+class InputRangeConfig(BaseModel):
+    """Supported UI/API input boundaries and measurement units."""
+    parameter: str
+    min_value: float
+    max_value: float
+    unit: str
+    description: str
+
+
+class ConfigResponse(BaseModel):
+    """Global system configuration, crops, weather scenarios, and input boundaries."""
+    region_name: str = Field(default="Punjab/Haryana-style paddy-wheat reference belt")
+    synthetic_data_disclosure: str = Field(
+        default="Synthetic demo data calibrated to public agri statistics."
+    )
+    crops: List[CropConstraintConfig]
+    rainfall_scenarios: List[WeatherScenarioConfig]
+    optimization_modes: List[str]
+    supported_priorities: List[str]
+    default_land_ha: float = 10.0
+    baseline_assumptions: Dict[str, float]
+    input_ranges: List[InputRangeConfig]
+    units: Dict[str, str]
+
+
+class BaselineResponse(BaseModel):
+    """Reference farm baseline plan and resulting outputs."""
+    region_name: str = Field(default="Punjab/Haryana reference region")
+    total_land_ha: float = Field(..., description="Total reference farm land in hectares")
+    rainfall_scenario: str = Field(default="normal", description="Rainfall scenario")
+    water_availability_ratio: float = Field(default=1.0, description="Irrigation water availability ratio")
+    total_water_use_m3: float = Field(..., description="Total baseline seasonal irrigation water consumption in m³")
+    total_food_kcal: float = Field(..., description="Total baseline food energy production in kcal")
+    total_gross_revenue_inr: float = Field(..., description="Total baseline gross revenue in INR")
+    total_cultivation_cost_inr: float = Field(..., description="Total baseline cultivation cost in INR")
+    total_net_income_inr: float = Field(..., description="Total baseline net farmer income in INR")
+    allocations: List[CropAllocationResult] = Field(..., description="Baseline crop allocations and outputs")
+
+
+# =============================================================================
+# Water Sweep Simulation Schemas (Phase 4)
+# =============================================================================
+
+class SweepPoint(BaseModel):
+    """Single point in a parametric water availability sweep."""
+    water_availability_ratio: float = Field(..., description="Relative water availability ratio (1.0 to 0.2)")
+    water_budget_reduction_pct: float = Field(..., description="Water cut percentage (0% to 80%)")
+    water_budget_m3: float = Field(..., description="Water budget in m³")
+    total_water_use_m3: float = Field(..., description="Actual water use in m³")
+    water_slack_m3: float = Field(..., description="Water shortfall/slack in m³")
+    total_food_kcal: float = Field(..., description="Total food calories produced in kcal")
+    food_slack_kcal: float = Field(..., description="Food calories shortfall in kcal")
+    total_net_income_inr: float = Field(..., description="Net farm income in INR")
+    income_slack_inr: float = Field(..., description="Net income shortfall in INR")
+    allocations_ha: Dict[str, float] = Field(..., description="Hectares allocated per crop")
+    allocations_pct: Dict[str, float] = Field(..., description="Land percentage per crop")
+    primary_bottleneck: Optional[str] = Field(default=None, description="Primary bottleneck dimension")
+    all_targets_met: bool = Field(..., description="True if all targets met without slack")
+
+
+class SweepRequest(BaseModel):
+    """Request payload for running a parametric water availability sweep."""
+    total_land_ha: float = Field(default=10.0, gt=0.0, description="Available farm land in hectares")
+    rainfall_scenario: str = Field(default="normal", description="Rainfall scenario")
+    start_ratio: float = Field(default=1.0, ge=0.05, le=2.0, description="Starting water ratio (default 1.0)")
+    end_ratio: float = Field(default=0.20, ge=0.05, le=2.0, description="Ending water ratio (default 0.20)")
+    step: float = Field(default=0.10, gt=0.0, le=1.0, description="Step size (default 0.10)")
+    selected_crops: Optional[List[str]] = Field(default=None, description="Allowed crops")
+    optimization_mode: OptimizationMode = Field(default=OptimizationMode.WEIGHTED, description="Optimization mode")
+    weights: Optional[OptimizationWeights] = Field(default=None, description="Priority weights")
+
+    @field_validator("rainfall_scenario")
+    @classmethod
+    def normalize_scenario(cls, v: str) -> str:
+        val = v.strip().lower()
+        allowed = {"normal", "deficit", "severe_deficit", "surplus"}
+        if val not in allowed:
+            raise ValueError(f"Unknown rainfall_scenario '{v}'. Allowed: {sorted(list(allowed))}")
+        return val
+
+
+class SweepResponse(BaseModel):
+    """Output containing structured trade-off curve points across water availability levels."""
+    total_land_ha: float
+    rainfall_scenario: str
+    baseline_water_m3: float
+    baseline_food_kcal: float
+    baseline_income_inr: float
+    points: List[SweepPoint]
+    tipping_point_water_ratio: Optional[float] = Field(
+        default=None,
+        description="First water availability ratio where targets can no longer be satisfied without slack"
+    )
+    tipping_point_description: Optional[str] = Field(
+        default=None,
+        description="Description of the tipping point transition"
+    )

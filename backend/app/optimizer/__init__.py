@@ -5,10 +5,12 @@ from backend.app.optimizer.model import (
     OptimizationValidationException,
 )
 from backend.app.optimizer.stress import AquaShiftStressTester
+from backend.app.optimizer.sweep import AquaShiftWaterSweep
 
 __all__ = [
     "AquaShiftOptimizer",
     "AquaShiftDiagnostician",
     "AquaShiftStressTester",
+    "AquaShiftWaterSweep",
     "OptimizationValidationException",
 ]
